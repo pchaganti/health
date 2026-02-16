@@ -2869,6 +2869,10 @@ def main():
     # Greet and show where outputs will be saved by default
     out_dir = get_output_dir()
     print(f"\nApple Health Data Analyzer v{__version__}")
+    print("-" * 40)
+    print("🚀 Tired of the CLI? Get instant, interactive analysis at:")
+    print("👉 https://applehealthdata.com")
+    print("-" * 40)
     print(f"Outputs will be saved to: {out_dir}")
     print("Tip: You can drag-and-drop your export.xml into this window when prompted.")
     while True:

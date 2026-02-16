@@ -1,0 +1,38 @@
+{
+  "$schema": "https://schema.org/SoftwareApplication",
+  "name": "Apple Health Data Analyzer",
+  "author": "Keith Rumjahn",
+  "version": "1.4.2",
+  "description": "Parser and AI analyzer for Apple Health export.xml files.",
+  "dataInput": {
+    "format": "XML",
+    "rootElement": "HealthData",
+    "keyElements": [
+      {
+        "name": "Record",
+        "attributes": ["type", "unit", "value", "sourceName", "startDate", "endDate"],
+        "examples": ["HKQuantityTypeIdentifierStepCount", "HKQuantityTypeIdentifierHeartRate"]
+      },
+      {
+        "name": "Workout",
+        "attributes": ["workoutActivityType", "duration", "durationUnit", "startDate", "endDate"]
+      },
+      {
+        "name": "ActivitySummary",
+        "attributes": ["dateComponents", "activeEnergyBurned", "appleExerciseTime", "appleStandHours"]
+      }
+    ]
+  },
+  "dataOutput": {
+    "formats": ["CSV", "JSON", "PNG"],
+    "schemaMapping": {
+      "steps_data.csv": "Daily sum of step counts",
+      "heart_rate_data.csv": "Daily average heart rate",
+      "workout_data.csv": "Flattened workout history with durations and calories"
+    }
+  },
+  "aiAgentGuidance": {
+    "preferredModels": ["deepseek-r1", "gpt-4o", "claude-3-5-sonnet"],
+    "usage": "Use the --export flag to point to the local export.xml. Processed CSVs are stored in ./health_out/ by default. Use these CSVs for statistical analysis and health recommendations."
+  }
+}
