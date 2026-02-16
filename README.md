@@ -20,6 +20,7 @@ This is an open-source technical toolkit for solopreneurs, researchers, and bioh
 It transforms the complex Apple Health `export.xml` into clean **CSV/JSON** datasets and provides a direct bridge to **AI reasoning engines**. Whether you want to use ChatGPT or run **100% private local analysis with DeepSeek-R1**, this tool handles the heavy lifting of data parsing and visualization.
 
 ## ✨ Key Features
+- 💍 **Smart Ring Integration**: Unified analysis for **Oura**, **Whoop**, and **Samsung Ring** via Apple Health sync.
 - 🧠 **DeepSeek-R1 & Local AI**: Run 100% private health audits using Ollama (no data leaves your machine).
 - 📊 **Automated Visualizations**: Instantly generate charts for heart rate cycles, sleep patterns, and workout intensity.
 - 📤 **High-Fidelity Export**: XML → CSV/JSON conversion that preserves all metadata (Record, Workout, ActivitySummary).
