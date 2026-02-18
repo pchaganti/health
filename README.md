@@ -62,9 +62,25 @@ git clone https://github.com/krumjahn/applehealth.git && cd applehealth
 - **Viz**: Matplotlib
 - **AI**: OpenAI, Anthropic, Google, and Ollama APIs
 
+## 🐳 Docker (The "No-Setup" Way)
+If you have Docker installed, you can run the analyzer without installing Python or dependencies locally:
+
+```bash
+# 1) Build the image
+docker build -t applehealth .
+
+# 2) Run the container (mount your export.xml and an output folder)
+docker run -it \
+  -v "/path/to/your/export.xml:/export.xml" \
+  -v "$(pwd)/out:/out" \
+  applehealth
+```
+
 ## 🌟 Visuals & Charts
+![xml-csv-logo](assets/xml-csv-logo.png)
 ![workouts](https://github.com/user-attachments/assets/6c373d3e-e038-4428-a8be-7c86c973a662)
 ![heartrate](https://github.com/user-attachments/assets/7f739661-f822-49e7-b79c-209c5164ecdc)
+![lm-ollama-support](assets/lm-ollama-support.png)
 
 ## 🤝 Contributing & Community
 Join our community of builders! If you improve the parser or add a new visualization, please submit a PR.
