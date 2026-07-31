@@ -31,7 +31,7 @@ Then run:
 healthai
 ```
 
-On first launch, a setup wizard walks you through choosing your AI model (GPT-4o, Claude, Gemini, DeepSeek-R1, and 50+ more), setting your API key, and pointing to your `export.xml`. Re-run it any time with `healthai --setup`.
+On first launch, a setup wizard walks you through choosing your AI model (GPT-4o, Claude, Gemini, DeepSeek-R1, and 50+ more), setting your API key, and pointing to your `export.xml`. Re-run it any time with `healthai --setup`. The saved export path is reused by slash commands and chat.
 
 ### 🚀 **Prefer a GUI?**
 Visit **[applehealthdata.com](https://applehealthdata.com)** for instant, interactive analysis without the terminal.
@@ -45,10 +45,10 @@ A purpose-built CLI that turns your Apple Health `export.xml` into a conversatio
 It's built for developers, biohackers, and researchers who want **full control** over their health data pipeline.
 
 ## ✨ Key Features
-- 💬 **Chat REPL**: Ask questions in plain English. `"What were my most active months last year?"` — just type it.
+- 💬 **Chat REPL**: Ask questions in plain English. `"What were my most active months last year?"` — chat builds query-aware local summaries and includes recent complete rows.
 - 🧠 **50+ AI Models**: GPT-4o, Claude, Gemini, DeepSeek-R1, Grok, Mistral, Llama, and any Ollama local model.
 - 🔒 **100% Private Mode**: Run DeepSeek-R1 or Llama 3 locally via Ollama — no data leaves your machine.
-- 📊 **Automated Charts**: Heart rate cycles, sleep patterns, workout intensity — generated with one slash command.
+- 📊 **Automated Charts**: Daily heart-rate means, source-reconciled sleep patterns, and workout heart-rate intensity.
 - 📤 **High-Fidelity Export**: XML → CSV/JSON preserving all metadata (Record, Workout, ActivitySummary).
 - 💍 **Smart Ring Integration**: Unified view of **Oura**, **Whoop**, and **Samsung Ring** data via Apple Health sync.
 - 🔄 **WHOOP Integration**: Specialized support for augmenting Apple Health data with WHOOP metrics.
@@ -71,15 +71,15 @@ Slash commands handle data operations:
 
 | Command | Description |
 |---|---|
-| `/diagnose` | Full health data report across all metrics |
+| `/diagnose` | Audit metric calculations, units, sources, skipped records, and export types |
 | `/steps` | Analyze step count trends |
-| `/heartrate` | Heart rate trends and anomalies |
-| `/sleep` | Sleep duration and quality patterns |
-| `/workouts` | Workout history and intensity |
-| `/weight` | Weight and BMI trends |
-| `/csv` | Export all metrics to CSV |
+| `/heartrate` | Daily average heart-rate trends |
+| `/sleep` | Source-reconciled sleep duration and stage patterns |
+| `/workouts` | Workout history with normalized distance, energy, and available heart-rate intensity |
+| `/weight` | Body-mass trends normalized to kilograms |
+| `/csv` | Export raw records plus processed metric CSVs used by chat |
 | `/json` | Export all metrics to JSON |
-| `/settings` | View and change AI provider |
+| `/settings` | Change AI model, per-metric source priority, and maximum heart rate |
 | `/setup` | Re-run the setup wizard |
 | `/help` | Show all available commands |
 | `/exit` | Quit |
@@ -98,6 +98,12 @@ I used this exact tool to analyze 8 years of my own fitness history. Here's the 
 curl -fsSL https://raw.githubusercontent.com/krumjahn/applehealth/main/install.sh | bash
 healthai
 ```
+
+### Calculation policy
+
+Apple Health exports can contain overlapping measurements from an iPhone, Apple Watch, and third-party devices. `healthai` now reconciles overlapping cumulative intervals instead of blindly adding every source. Its automatic order prefers manually entered Health data, then Apple Watch, then iPhone/iPad, then third-party sources. Because `export.xml` does not include the source order configured in the Health app, use `/settings` to set the exact priority for each metric when your preferred tracker differs.
+
+All supported units are normalized before aggregation: distance to kilometers, body mass to kilograms, energy to kilocalories, and heart rate to BPM. Unsupported units are skipped and listed by `/diagnose`; they are never silently mislabeled.
 
 **Or clone and run directly:**
 ```bash

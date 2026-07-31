@@ -11,7 +11,7 @@ This script analyzes exported Apple Health data (export.xml) with a focus on:
 - Workouts (specifically WHOOP workout data)
 
 Requirements:
-- Python 3.6+
+- Python 3.9+
 - pandas
 - matplotlib7
 - xml.etree.ElementTree
@@ -26,13 +26,13 @@ Usage:
 
 Author: Keith Rumjahn
 License: MIT
-Version: 1.4.1
 """
 
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pandas import DataFrame, read_csv
 from pandas.core.groupby import DataFrameGroupBy
+import pandas as pd
 import matplotlib.pyplot as plt
 import openai
 import os
@@ -49,6 +49,19 @@ from typing import Optional, List, Dict, Any, Tuple
 import re
 from healthai import __version__
 from healthai.setup_wizard import is_setup_complete, run_setup
+from healthai.preferences import (
+    load_preferences,
+    preferences_path,
+    save_preferences,
+)
+from healthai.health_data import (
+    BODY_MASS,
+    DISTANCE_WALKING_RUNNING,
+    HEART_RATE,
+    SLEEP_ANALYSIS,
+    STEP_COUNT,
+    HealthDataSet,
+)
 try:
     import anthropic  # Claude SDK
 except Exception:
@@ -57,10 +70,7 @@ try:
     import google.generativeai as genai  # Gemini SDK
 except Exception:
     genai = None
-try:
-    from litellm import completion as litellm_completion
-except Exception:
-    litellm_completion = None
+litellm_completion = None
 
 # Optional user-provided path to export.xml (from CLI or prompt)
 _export_xml_path = None
@@ -116,32 +126,14 @@ def print_open_hint(file_path: str):
 # Simple persisted preferences for AI and paths
 # Store under user home to avoid bootstrapping OUTPUT_DIR recursion
 def _prefs_path() -> str:
-    try:
-        env_path = os.environ.get('APPLEHEALTH_PREFS')
-        if env_path:
-            return os.path.abspath(os.path.expanduser(env_path))
-        home = os.path.expanduser('~')
-        pref_dir = os.path.join(home, '.applehealth')
-        os.makedirs(pref_dir, exist_ok=True)
-        return os.path.join(pref_dir, 'ai_prefs.json')
-    except Exception:
-        # Fallback to CWD
-        return os.path.abspath('ai_prefs.json')
+    return str(preferences_path())
 
 def _load_ai_prefs() -> dict:
-    try:
-        path = _prefs_path()
-        if os.path.exists(path):
-            with open(path, 'r') as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return {}
+    return load_preferences()
 
 def _save_ai_prefs(prefs: dict):
     try:
-        with open(_prefs_path(), 'w') as f:
-            json.dump(prefs, f, indent=2)
+        save_preferences(prefs)
     except Exception:
         pass
 
@@ -795,9 +787,15 @@ def _resolve_litellm_model(provider: Dict[str, Any], selected_model: str) -> Tup
 
 def analyze_with_litellm(csv_files):
     """Analyze health data using a LiteLLM-backed provider selection flow."""
+    global litellm_completion
     if litellm_completion is None:
-        print("LiteLLM is not installed. Run: pip install litellm")
-        return
+        try:
+            from litellm import completion
+
+            litellm_completion = completion
+        except Exception:
+            print("LiteLLM is not installed. Run: pip install litellm")
+            return
 
     data_summary, prompt = _prepare_ai_data(csv_files)
     if prompt is None:
@@ -1045,6 +1043,62 @@ def _sanitize_user_path(inp: str) -> str:
     except Exception:
         return inp
 
+
+def _calculation_preferences() -> Tuple[dict, str, Optional[float]]:
+    prefs = _load_ai_prefs()
+    priorities = prefs.get("source_priorities", {})
+    if not isinstance(priorities, dict):
+        priorities = {}
+    source_mode = prefs.get("source_mode", "reconcile")
+    if source_mode not in {"reconcile", "all"}:
+        source_mode = "reconcile"
+    try:
+        max_heart_rate = float(prefs["max_heart_rate"])
+    except (KeyError, TypeError, ValueError):
+        max_heart_rate = None
+    return priorities, source_mode, max_heart_rate
+
+
+def _daily_quantity(
+    dataset: HealthDataSet,
+    record_type: str,
+    aggregation: str,
+):
+    priorities, source_mode, _ = _calculation_preferences()
+    return dataset.daily_quantity(
+        record_type,
+        aggregation,
+        priorities.get(record_type),
+        source_mode,
+    )
+
+
+def prepare_metric_exports(
+    export_path: Optional[str] = None,
+    output_dir: Optional[str] = None,
+    quiet: bool = False,
+) -> Dict[str, str]:
+    """Generate the processed CSV files used by slash commands and chat."""
+    resolved_export = export_path or resolve_export_xml()
+    resolved_output = output_dir or get_output_dir()
+    priorities, source_mode, max_heart_rate = _calculation_preferences()
+    if not quiet:
+        print("Generating source-aware daily metric files...")
+    dataset = HealthDataSet(resolved_export)
+    written = dataset.write_metric_exports(
+        resolved_output,
+        source_priorities=priorities,
+        source_mode=source_mode,
+        max_heart_rate=max_heart_rate,
+    )
+    if not quiet:
+        for filename, path in sorted(written.items()):
+            print(f"- {filename}: {path}")
+        if dataset.issues:
+            print(f"- Skipped {len(dataset.issues)} unsupported or malformed records")
+    return {filename: str(path) for filename, path in written.items()}
+
+
 def parse_health_data(file_path, record_type):
     """
     Parse specific health metrics from Apple Health export.xml file.
@@ -1057,52 +1111,27 @@ def parse_health_data(file_path, record_type):
         pandas.DataFrame: DataFrame containing dates and values for the specified metric
     """
     print(f"Starting to parse {record_type}...")
-    dates = []
-    values = []
-    
-    tree = ET.parse(file_path)
-    root = tree.getroot()
-    
-    print("XML file loaded, searching records...")
-    
-    bad_samples = []
-    for record in root.findall('.//Record'):
-        if record.get('type') == record_type:
-            try:
-                value = float(record.get('value'))
-                date = datetime.strptime(record.get('endDate'), '%Y-%m-%d %H:%M:%S %z')
-                dates.append(date)
-                values.append(value)
-            except (ValueError, TypeError):
-                # Collect a few bad samples to aid debugging
-                if len(bad_samples) < 3:
-                    bad_samples.append({
-                        'type': record.get('type'),
-                        'value': record.get('value'),
-                        'startDate': record.get('startDate'),
-                        'endDate': record.get('endDate'),
-                        'unit': record.get('unit'),
-                        'sourceName': record.get('sourceName')
-                    })
-                continue
-    
-    print(f"Found {len(dates)} records")
-    # If we encountered parsing issues, persist a short debug note
-    if bad_samples:
+    dataset = HealthDataSet(file_path)
+    records = dataset.quantity_records(record_type)
+    print(f"Found {len(records)} records")
+    if dataset.issues:
         try:
             dbg_path = get_output_path(f"debug_{record_type}_parse_issues.json")
-            with open(dbg_path, 'w') as f:
-                json.dump({
-                    'record_type': record_type,
-                    'num_good': len(dates),
-                    'num_bad_samples': len(bad_samples),
-                    'bad_samples': bad_samples,
-                    'note': 'These records had non-numeric values for a quantity parser. This is normal if the type is a Category.'
-                }, f, indent=2)
+            with open(dbg_path, "w") as handle:
+                json.dump(
+                    {
+                        "record_type": record_type,
+                        "num_good": len(records),
+                        "num_skipped": len(dataset.issues),
+                        "issues": dataset.issues[:20],
+                    },
+                    handle,
+                    indent=2,
+                )
             print(f"Wrote debug sample to {dbg_path}")
         except Exception:
             pass
-    return DataFrame({'date': dates, 'value': values})
+    return records
 
 
 # --- Diagnostics & Debugging Helpers ---
@@ -1215,6 +1244,74 @@ def generate_debug_reports(file_path: str) -> Tuple[str, str]:
     Returns: (json_path, md_path)
     """
     summary = scan_export_types(file_path)
+    priorities, source_mode, max_heart_rate = _calculation_preferences()
+    dataset = HealthDataSet(file_path)
+    metric_summary: Dict[str, Any] = {}
+    for label, record_type, aggregation, unit in [
+        ("steps", STEP_COUNT, "cumulative", "count"),
+        ("distance", DISTANCE_WALKING_RUNNING, "cumulative", "km"),
+        ("heart_rate", HEART_RATE, "average", "BPM"),
+        ("weight", BODY_MASS, "latest", "kg"),
+    ]:
+        daily = dataset.daily_quantity(
+            record_type,
+            aggregation,
+            priorities.get(record_type),
+            source_mode,
+        )
+        metric_summary[label] = {
+            "unit": unit,
+            "days": len(daily),
+            "date_range": (
+                [str(daily.index.min()), str(daily.index.max())]
+                if len(daily)
+                else None
+            ),
+            "total": float(daily.sum()) if len(daily) else None,
+            "average": float(daily.mean()) if len(daily) else None,
+            "minimum": float(daily.min()) if len(daily) else None,
+            "maximum": float(daily.max()) if len(daily) else None,
+            "sources": dataset.available_sources(record_type),
+            "configured_priority": priorities.get(record_type, []),
+        }
+
+    daily_sleep, _, _ = dataset.sleep_summary(priorities.get(SLEEP_ANALYSIS))
+    workouts = dataset.workouts(
+        priorities.get(HEART_RATE),
+        max_heart_rate=max_heart_rate,
+    )
+    metric_summary["sleep"] = {
+        "unit": "hours",
+        "nights": len(daily_sleep),
+        "date_range": (
+            [str(daily_sleep.index.min()), str(daily_sleep.index.max())]
+            if len(daily_sleep)
+            else None
+        ),
+        "total": float(daily_sleep.sum()) if len(daily_sleep) else None,
+        "average": float(daily_sleep.mean()) if len(daily_sleep) else None,
+        "sources": dataset.available_sources(SLEEP_ANALYSIS),
+        "configured_priority": priorities.get(SLEEP_ANALYSIS, []),
+    }
+    metric_summary["workouts"] = {
+        "count": len(workouts),
+        "date_range": (
+            [str(workouts["date"].min()), str(workouts["date"].max())]
+            if len(workouts)
+            else None
+        ),
+        "total_minutes": (
+            float(workouts["duration_minutes"].sum()) if len(workouts) else None
+        ),
+        "total_km": float(workouts["distance_km"].sum()) if len(workouts) else None,
+        "total_kcal": float(workouts["calories"].sum()) if len(workouts) else None,
+        "with_heart_rate": (
+            int(workouts["avg_heart_rate"].notna().sum()) if len(workouts) else 0
+        ),
+    }
+    summary["source_mode"] = source_mode
+    summary["metric_summary"] = metric_summary
+    summary["calculation_issues"] = dataset.issues
     out_dir = get_output_dir()
     json_path = os.path.join(out_dir, 'health_types_report.json')
     md_path = os.path.join(out_dir, 'health_types_report.md')
@@ -1248,6 +1345,19 @@ def generate_debug_reports(file_path: str) -> Tuple[str, str]:
             for t in summary['unknown_types']:
                 st = summary['by_type'][t]
                 lines.append(f"- {t}: {st['count']} records, examples={st['value_examples']}\n")
+        lines.append("\n## Calculated Metric Audit\n")
+        lines.append(
+            f"- Source handling: {summary['source_mode']} "
+            "(overlapping sources are reconciled unless legacy `all` mode is selected)\n"
+        )
+        for label, metric in summary["metric_summary"].items():
+            lines.append(f"\n### {label.replace('_', ' ').title()}\n")
+            for key, value in metric.items():
+                lines.append(f"- {key.replace('_', ' ').title()}: {value}\n")
+        if summary["calculation_issues"]:
+            lines.append("\n## Skipped or Unsupported Records\n")
+            for issue in summary["calculation_issues"][:100]:
+                lines.append(f"- {issue}\n")
         lines.append("\nNote: Category and event types are not corrupt. If you’re troubleshooting, please attach this file and the JSON with your report.\n")
         with open(md_path, 'w') as f:
             f.write("".join(lines))
@@ -1265,19 +1375,17 @@ def analyze_steps():
     """
     export_path = resolve_export_xml()
     print(f"Using export file: {export_path}")
-    df = parse_health_data(export_path, 'HKQuantityTypeIdentifierStepCount')
+    dataset = HealthDataSet(export_path)
+    daily_steps = _daily_quantity(dataset, STEP_COUNT, "cumulative")
     
     # Check if any step data was found
-    if len(df) == 0:
+    if len(daily_steps) == 0:
         print("No step data found in the export file.")
         # Create an empty CSV file to indicate processing was attempted
         empty_csv = get_output_path('steps_data.csv')
         DataFrame(columns=['date', 'value']).to_csv(empty_csv, index=False)
         print(f"Created empty steps_data.csv at {empty_csv}.")
         return
-    
-    # Daily sum of steps
-    daily_steps = df.groupby(df['date'].dt.date)['value'].sum()
     
     # Export to CSV
     csv_main = get_output_path('steps_data.csv')
@@ -1341,8 +1449,6 @@ def analyze_steps():
             print(f"- CSV (compat): {csv_compat}")
         print(f"- Plot: {plot_path}")
         print_open_hint(plot_path)
-        print_open_hint(plot_path)
-        print_open_hint(plot_path)
     except Exception:
         # Non-fatal if any of the above fails
         pass
@@ -1354,18 +1460,20 @@ def analyze_distance():
     """
     export_path = resolve_export_xml()
     print(f"Using export file: {export_path}")
-    df = parse_health_data(export_path, 'HKQuantityTypeIdentifierDistanceWalkingRunning')
+    dataset = HealthDataSet(export_path)
+    daily_distance = _daily_quantity(
+        dataset,
+        DISTANCE_WALKING_RUNNING,
+        "cumulative",
+    )
     
     # Check if any distance data was found
-    if len(df) == 0:
+    if len(daily_distance) == 0:
         print("No distance data found in the export file.")
         # Create an empty CSV file to indicate processing was attempted
         DataFrame(columns=['date', 'value']).to_csv(get_output_path('distance_data.csv'), index=False)
         print(f"Created empty distance_data.csv at {get_output_path('distance_data.csv')}")
         return
-    
-    # Daily sum of distance (already in kilometers from Apple Health)
-    daily_distance = df.groupby(df['date'].dt.date)['value'].sum()
     
     # Export to CSV
     csv_path = get_output_path('distance_data.csv')
@@ -1422,18 +1530,16 @@ def analyze_heart_rate():
     """
     export_path = resolve_export_xml()
     print(f"Using export file: {export_path}")
-    df = parse_health_data(export_path, 'HKQuantityTypeIdentifierHeartRate')
+    dataset = HealthDataSet(export_path)
+    daily_hr = _daily_quantity(dataset, HEART_RATE, "average")
     
     # Check if any heart rate data was found
-    if len(df) == 0:
+    if len(daily_hr) == 0:
         print("No heart rate data found in the export file.")
         # Create an empty CSV file to indicate processing was attempted
         DataFrame(columns=['date', 'value']).to_csv(get_output_path('heart_rate_data.csv'), index=False)
         print(f"Created empty heart_rate_data.csv at {get_output_path('heart_rate_data.csv')}")
         return
-    
-    # Daily average heart rate
-    daily_hr = df.groupby(df['date'].dt.date)['value'].mean()
     
     # Export to CSV
     csv_path = get_output_path('heart_rate_data.csv')
@@ -1491,18 +1597,16 @@ def analyze_weight():
     """
     export_path = resolve_export_xml()
     print(f"Using export file: {export_path}")
-    df = parse_health_data(export_path, 'HKQuantityTypeIdentifierBodyMass')
+    dataset = HealthDataSet(export_path)
+    daily_weight = _daily_quantity(dataset, BODY_MASS, "latest")
     
     # Check if any weight data was found
-    if len(df) == 0:
+    if len(daily_weight) == 0:
         print("No weight data found in the export file.")
         # Create an empty CSV file to indicate processing was attempted
         DataFrame(columns=['date', 'value']).to_csv(get_output_path('weight_data.csv'), index=False)
         print(f"Created empty weight_data.csv at {get_output_path('weight_data.csv')}")
         return
-    
-    # Daily weight (taking the last measurement of each day)
-    daily_weight = df.groupby(df['date'].dt.date)['value'].last()
     
     # Export to CSV
     csv_path = get_output_path('weight_data.csv')
@@ -1559,112 +1663,89 @@ def analyze_sleep():
     print("Analyzing sleep data...")
     export_path = resolve_export_xml()
     print(f"Using export file: {export_path}")
-    tree = ET.parse(export_path)
-    root = tree.getroot()
-    
-    sleep_records = []
-    
-    # Process sleep records
-    for record in root.findall('.//Record'):
-        if record.get('type') == 'HKCategoryTypeIdentifierSleepAnalysis':
-            try:
-                start_date_str = record.get('startDate')
-                end_date_str = record.get('endDate')
-                sleep_value = record.get('value')
-                source_name = record.get('sourceName', 'Unknown')
-                
-                if not start_date_str or not end_date_str or not sleep_value:
-                    continue
-                    
-                # Parse dates
-                start_date = datetime.strptime(start_date_str, '%Y-%m-%d %H:%M:%S %z')
-                end_date = datetime.strptime(end_date_str, '%Y-%m-%d %H:%M:%S %z')
-                
-                # Calculate duration in minutes
-                duration_minutes = (end_date - start_date).total_seconds() / 60
-                
-                # Classify sleep type
-                sleep_type = 'Unknown'
-                if 'InBed' in sleep_value:
-                    sleep_type = 'In Bed'
-                elif 'AsleepUnspecified' in sleep_value:
-                    sleep_type = 'Asleep'
-                elif 'AsleepREM' in sleep_value:
-                    sleep_type = 'REM Sleep'
-                elif 'AsleepCore' in sleep_value:
-                    sleep_type = 'Core Sleep'
-                elif 'AsleepDeep' in sleep_value:
-                    sleep_type = 'Deep Sleep'
-                elif 'Awake' in sleep_value:
-                    sleep_type = 'Awake'
-                
-                sleep_records.append({
-                    'date': start_date.date(),
-                    'start_time': start_date.time(),
-                    'end_time': end_date.time(),
-                    'duration_minutes': round(duration_minutes, 1),
-                    'duration_hours': round(duration_minutes / 60, 2),
-                    'sleep_type': sleep_type,
-                    'sleep_value': sleep_value,
-                    'source': source_name
-                })
-                
-            except (ValueError, TypeError) as e:
-                continue
-    
-    if not sleep_records:
+    dataset = HealthDataSet(export_path)
+    records = dataset.sleep_records()
+    priorities, _, _ = _calculation_preferences()
+    daily_sleep, stage_daily, daily_in_bed = dataset.sleep_summary(
+        priorities.get(SLEEP_ANALYSIS)
+    )
+
+    if records.empty:
         print("No sleep data found!")
+        DataFrame(
+            columns=[
+                "date",
+                "start_time",
+                "end_time",
+                "duration_minutes",
+                "duration_hours",
+                "sleep_type",
+                "sleep_value",
+                "source",
+            ]
+        ).to_csv(get_output_path("sleep_data.csv"), index=False)
         return
-        
-    df = DataFrame(sleep_records)
-    df = df.sort_values('date')
-    
-    # Export to CSV
-    export_df = df.copy()
-    export_df['date'] = export_df['date'].astype(str)
-    csv_path = get_output_path('sleep_data.csv')
+
+    export_df = DataFrame(
+        {
+            "date": records["night_date"],
+            "start_time": records["start"].map(lambda value: value.isoformat()),
+            "end_time": records["end"].map(lambda value: value.isoformat()),
+            "duration_minutes": records["duration_hours"] * 60,
+            "duration_hours": records["duration_hours"],
+            "sleep_type": records["sleep_type"],
+            "sleep_value": records["sleep_value"],
+            "source": records["source"],
+        }
+    ).sort_values("start_time")
+    csv_path = get_output_path("sleep_data.csv")
     export_df.to_csv(csv_path, index=False)
-    print(f"\nSleep data exported to {csv_path}")
-    print(f"Exported {len(export_df)} sleep records")
-    
-    # Display first few rows
-    print("\nFirst few rows of exported data:")
-    print(export_df.head())
-    
-    # Calculate daily sleep totals (excluding 'Awake' periods for actual sleep time)
-    sleep_only = df[~df['sleep_type'].isin(['Awake', 'In Bed'])]
-    daily_sleep = sleep_only.groupby('date')['duration_hours'].sum()
-    
-    # Also calculate total time in bed
-    in_bed_data = df[df['sleep_type'] == 'In Bed']
-    daily_in_bed = in_bed_data.groupby('date')['duration_hours'].sum()
-    
-    # Plot
+
+    sleep_daily = daily_sleep.to_frame()
+    sleep_daily["in_bed_hours"] = daily_in_bed
+    sleep_daily = sleep_daily.join(stage_daily, how="outer").fillna(0.0)
+    daily_csv_path = get_output_path("sleep_daily.csv")
+    sleep_daily.to_csv(daily_csv_path)
+    print(f"\nSleep records exported to {csv_path}")
+    print(f"Source-reconciled nightly totals exported to {daily_csv_path}")
+    print(f"Exported {len(export_df)} raw records across {len(daily_sleep)} nights")
+
     plt.figure(figsize=(12, 8))
-    
-    # Plot 1: Daily sleep duration
     plt.subplot(2, 1, 1)
-    if len(daily_sleep) > 0:
-        daily_sleep.plot(kind='line', marker='o', alpha=0.7)
-        plt.title('Daily Sleep Duration (Excluding Awake Time)')
-        plt.xlabel('Date')
-        plt.ylabel('Sleep Duration (hours)')
-        plt.grid(True, alpha=0.3)
-        plt.xticks(rotation=45)
-    
-    # Plot 2: Sleep type breakdown over time
-    plt.subplot(2, 1, 2)
-    sleep_type_daily = df.groupby(['date', 'sleep_type'])['duration_hours'].sum().unstack(fill_value=0)
-    sleep_type_daily.plot(kind='area', stacked=True, alpha=0.7)
-    plt.title('Daily Sleep Composition by Type')
-    plt.xlabel('Date')
-    plt.ylabel('Duration (hours)')
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    daily_sleep.plot(kind="line", marker="o", alpha=0.8, label="Asleep")
+    if daily_in_bed.notna().any():
+        daily_in_bed.plot(
+            kind="line",
+            alpha=0.5,
+            linestyle="--",
+            label="In bed",
+        )
+    plt.title("Nightly Sleep Duration (Sources Reconciled)")
+    plt.xlabel("Wake Date")
+    plt.ylabel("Duration (hours)")
+    plt.legend()
     plt.grid(True, alpha=0.3)
-    plt.xticks(rotation=45)
-    
+
+    plt.subplot(2, 1, 2)
+    composition_columns = [
+        column
+        for column in ("Awake", "REM Sleep", "Core Sleep", "Deep Sleep", "Asleep")
+        if column in stage_daily
+    ]
+    if composition_columns:
+        stage_daily[composition_columns].plot(
+            kind="area",
+            stacked=True,
+            alpha=0.7,
+            ax=plt.gca(),
+        )
+    plt.title("Sleep Stages (In-Bed Samples Shown Separately Above)")
+    plt.xlabel("Wake Date")
+    plt.ylabel("Duration (hours)")
+    plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    plot_path = get_output_path('sleep_plot.png')
+
+    plot_path = get_output_path("sleep_plot.png")
     try:
         plt.savefig(plot_path)
     except Exception:
@@ -1675,41 +1756,28 @@ def analyze_sleep():
         print("(Plot saved to file; display not available)")
     finally:
         plt.close()
-    
-    # Print summary statistics
-    print(f"\nSleep Summary:")
-    print(f"Total sleep records: {len(df)}")
-    print(f"Date range: {df['date'].min()} to {df['date'].max()}")
-    
-    if len(daily_sleep) > 0:
-        print(f"Average nightly sleep: {daily_sleep.mean():.1f} hours")
-        print(f"Total sleep time: {daily_sleep.sum():.1f} hours")
-    print(f"CSV: {csv_path}")
-    print(f"Plot: {plot_path}")
+
+    print("\nSleep Summary:")
+    print(f"- Date range: {daily_sleep.index.min()} to {daily_sleep.index.max()}")
+    print(f"- Average nightly sleep: {daily_sleep.mean():.1f} hours")
+    print(f"- Total sleep time: {daily_sleep.sum():.1f} hours")
+    print(f"- Raw CSV: {csv_path}")
+    print(f"- Daily CSV: {daily_csv_path}")
+    print(f"- Plot: {plot_path}")
     print_open_hint(plot_path)
-    
-    # Sleep type breakdown
-    print(f"\nSleep Type Breakdown:")
-    type_summary = df.groupby('sleep_type').agg({
-        'duration_hours': ['count', 'sum', 'mean']
-    }).round(2)
-    for sleep_type in df['sleep_type'].unique():
-        records = df[df['sleep_type'] == sleep_type]
-        total_hours = records['duration_hours'].sum()
-        avg_duration = records['duration_hours'].mean()
-        count = len(records)
-        print(f"  {sleep_type}: {count} records, {total_hours:.1f} total hours (avg {avg_duration:.1f}h per record)")
-    
-    # Source breakdown
-    print(f"\nData Sources:")
-    for source in df['source'].unique():
-        count = len(df[df['source'] == source])
+
+    print("\nReconciled Sleep Stage Breakdown:")
+    for sleep_type in stage_daily.columns:
+        print(f"  {sleep_type}: {stage_daily[sleep_type].sum():.1f} total hours")
+
+    print("\nData Sources:")
+    for source, count in records["source"].value_counts().items():
         print(f"  {source}: {count} records")
-    
-    print(f"\nRecent Sleep Records:")
-    recent = df.sort_values('date', ascending=False).head(10)
-    for _, record in recent.iterrows():
-        print(f"\nDate: {record['date']} ({record['start_time']} - {record['end_time']})")
+
+    print("\nRecent Sleep Records:")
+    for _, record in export_df.sort_values("start_time", ascending=False).head(10).iterrows():
+        print(f"\nNight: {record['date']}")
+        print(f"Interval: {record['start_time']} to {record['end_time']}")
         print(f"Type: {record['sleep_type']}")
         print(f"Duration: {record['duration_hours']:.1f} hours")
         print(f"Source: {record['source']}")
@@ -1722,104 +1790,62 @@ def analyze_workouts():
     print("Analyzing workout data...")
     export_path = resolve_export_xml()
     print(f"Using export file: {export_path}")
-    tree = ET.parse(export_path)
-    root = tree.getroot()
-    
-    workouts = []
-    
-    # Process Workout elements
-    for workout in root.findall('.//Workout'):
-        try:
-            # Extract basic workout info
-            activity_type = workout.get('workoutActivityType', 'Unknown')
-            duration_str = workout.get('duration')
-            duration_unit = workout.get('durationUnit', 'min')
-            start_date_str = workout.get('startDate')
-            end_date_str = workout.get('endDate')
-            source_name = workout.get('sourceName', 'Unknown')
-            
-            if not duration_str or not start_date_str:
-                continue
-                
-            # Parse dates
-            start_date = datetime.strptime(start_date_str, '%Y-%m-%d %H:%M:%S %z')
-            end_date = datetime.strptime(end_date_str, '%Y-%m-%d %H:%M:%S %z')
-            
-            # Convert duration to minutes
-            duration_value = float(duration_str)
-            if duration_unit == 'min':
-                duration_minutes = duration_value
-            elif duration_unit == 'sec':
-                duration_minutes = duration_value / 60
-            elif duration_unit == 'h':
-                duration_minutes = duration_value * 60
-            else:
-                duration_minutes = duration_value  # assume minutes
-            
-            # Extract calories and distance from WorkoutStatistics
-            calories = 0
-            distance_km = 0
-            
-            for stat in workout.findall('.//WorkoutStatistics'):
-                stat_type = stat.get('type', '')
-                sum_value = stat.get('sum')
-                unit = stat.get('unit', '')
-                
-                if sum_value:
-                    if 'ActiveEnergyBurned' in stat_type:
-                        calories = float(sum_value)
-                    elif 'DistanceWalkingRunning' in stat_type:
-                        if unit == 'km':
-                            distance_km = float(sum_value)
-                        elif unit == 'm':
-                            distance_km = float(sum_value) / 1000
-            
-            workouts.append({
-                'date': start_date.date(),
-                'start_time': start_date.time(),
-                'activity_type': activity_type.replace('HKWorkoutActivityType', ''),
-                'duration_minutes': round(duration_minutes, 1),
-                'duration_hours': round(duration_minutes / 60, 2),
-                'calories': round(calories, 1),
-                'distance_km': round(distance_km, 2),
-                'source': source_name
-            })
-                
-        except (ValueError, TypeError) as e:
-            continue
-    
-    if not workouts:
+    priorities, _, max_heart_rate = _calculation_preferences()
+    dataset = HealthDataSet(export_path)
+    df = dataset.workouts(
+        source_priority=priorities.get(HEART_RATE),
+        max_heart_rate=max_heart_rate,
+    )
+
+    if df.empty:
         print("No workout data found!")
-        # Create an empty CSV file to indicate processing was attempted
-        DataFrame(columns=['date', 'duration_hours', 'avg_heart_rate', 'measurements']).to_csv(get_output_path('workout_data.csv'), index=False)
+        df.to_csv(get_output_path("workout_data.csv"), index=False)
         print(f"Created empty workout_data.csv at {get_output_path('workout_data.csv')}")
         return
-        
-    df = DataFrame(workouts)
-    df = df.sort_values('date')
-    
-    # Export to CSV with more descriptive column names
+
     export_df = df.copy()
-    export_df['date'] = export_df['date'].astype(str)  # Convert date to string for better CSV compatibility
-    csv_path = get_output_path('workout_data.csv')
+    export_df["date"] = export_df["date"].astype(str)
+    csv_path = get_output_path("workout_data.csv")
     export_df.to_csv(csv_path, index=False)
     print(f"\nWorkout data exported to {csv_path}")
     print(f"Exported {len(export_df)} workouts")
-    
-    # Display first few rows of exported data
-    print("\nFirst few rows of exported data:")
-    print(export_df.head())
-    
-    # Plot
+
     plt.figure(figsize=(12, 6))
-    plt.scatter(df['date'], df['duration_hours'], alpha=0.6, c=df.index, cmap='viridis')
-    plt.title('Workout Duration Over Time')
-    plt.xlabel('Date')
-    plt.ylabel('Duration (Hours)')
+    workouts_with_hr = df.dropna(subset=["avg_heart_rate"])
+    if not workouts_with_hr.empty:
+        scatter = plt.scatter(
+            workouts_with_hr["date"],
+            workouts_with_hr["duration_hours"],
+            alpha=0.7,
+            c=workouts_with_hr["avg_heart_rate"],
+            cmap="viridis",
+        )
+        plt.colorbar(scatter, label="Average Heart Rate (BPM)")
+        without_hr = df[df["avg_heart_rate"].isna()]
+        if not without_hr.empty:
+            plt.scatter(
+                without_hr["date"],
+                without_hr["duration_hours"],
+                alpha=0.4,
+                color="gray",
+                label="No heart-rate samples",
+            )
+            plt.legend()
+    else:
+        plt.scatter(
+            df["date"],
+            df["duration_hours"],
+            alpha=0.6,
+            c=df.index,
+            cmap="viridis",
+        )
+    plt.title("Workout Duration and Heart-Rate Intensity")
+    plt.xlabel("Date")
+    plt.ylabel("Duration (Hours)")
     plt.grid(True, alpha=0.3)
     plt.xticks(rotation=45)
     plt.tight_layout()
-    plot_path = get_output_path('workout_plot.png')
+    plot_path = get_output_path("workout_plot.png")
     try:
         plt.savefig(plot_path)
     except Exception:
@@ -1830,8 +1856,7 @@ def analyze_workouts():
         print("(Plot saved to file; display not available)")
     finally:
         plt.close()
-    
-    # Print summary statistics
+
     print("\nWorkout Summary:")
     print(f"Total workouts: {len(df)}")
     print(f"Date range: {df['date'].min()} to {df['date'].max()}")
@@ -1841,24 +1866,51 @@ def analyze_workouts():
     print(f"Total distance: {df['distance_km'].sum():.1f} km")
     print(f"CSV: {csv_path}")
     print(f"Plot: {plot_path}")
-    
-    # Activity type breakdown
-    print(f"\nWorkout Types:")
-    activity_counts = df['activity_type'].value_counts()
+
+    if not workouts_with_hr.empty:
+        print(
+            f"Workouts with heart-rate intensity: "
+            f"{len(workouts_with_hr)} of {len(df)}"
+        )
+        print(
+            f"Average workout heart rate: "
+            f"{workouts_with_hr['avg_heart_rate'].mean():.1f} BPM"
+        )
+        print(
+            f"Highest workout heart rate: "
+            f"{workouts_with_hr['max_heart_rate'].max():.1f} BPM"
+        )
+        if max_heart_rate:
+            print(f"Configured max heart rate: {max_heart_rate:.0f} BPM")
+    else:
+        print("No heart-rate samples overlapped the exported workouts.")
+
+    print("\nWorkout Types:")
+    activity_counts = df["activity_type"].value_counts()
     for activity, count in activity_counts.head(10).items():
-        avg_duration = df[df['activity_type'] == activity]['duration_minutes'].mean()
+        avg_duration = df[df["activity_type"] == activity]["duration_minutes"].mean()
         print(f"  {activity}: {count} workouts (avg {avg_duration:.1f} min)")
-    
-    print(f"\nRecent Workouts:")
-    recent = df.sort_values('date', ascending=False).head(5)
+
+    print("\nRecent Workouts:")
+    recent = df.sort_values("start_time", ascending=False).head(5)
     for _, workout in recent.iterrows():
-        print(f"\nDate: {workout['date']} at {workout['start_time']}")
+        print(f"\nDate: {workout['start_time']}")
         print(f"Activity: {workout['activity_type']}")
         print(f"Duration: {workout['duration_minutes']:.1f} minutes")
-        if workout['calories'] > 0:
+        if workout["calories"] > 0:
             print(f"Calories: {workout['calories']:.0f} kcal")
-        if workout['distance_km'] > 0:
+        if workout["distance_km"] > 0:
             print(f"Distance: {workout['distance_km']:.1f} km")
+        if not pd.isna(workout["avg_heart_rate"]):
+            print(
+                f"Heart rate: avg {workout['avg_heart_rate']:.0f}, "
+                f"max {workout['max_heart_rate']:.0f} BPM"
+            )
+        if workout["intensity"]:
+            print(
+                f"Intensity: {workout['intensity']} "
+                f"({workout['intensity_percent_max']:.0f}% of configured max)"
+            )
 
 def analyze_with_chatgpt(csv_files):
     """
@@ -3234,10 +3286,11 @@ def analyze_with_msty(csv_files):
 def convert_xml_to_csv():
     """Convert Apple Health export.xml into comprehensive CSV files.
 
-    Creates three CSVs under the output directory:
+    Creates raw CSVs plus the processed metric CSVs used by chat:
     - records.csv: All <Record> elements (flattened attributes + metadata entries)
     - workouts.csv: All <Workout> elements (attributes + metadata)
     - activity_summary.csv: All <ActivitySummary> elements (attributes)
+    - *_data.csv: Normalized, source-aware daily metrics, sleep, and workouts
 
     Notes:
     - Metadata entries are flattened as columns named 'metadata:<key>'.
@@ -3356,6 +3409,17 @@ def convert_xml_to_csv():
     # Print quick-open tip for convenience
     if records_path:
         print_open_hint(records_path)
+
+    print("\nGenerating processed metric CSVs for chat and slash commands…")
+    priorities, source_mode, max_heart_rate = _calculation_preferences()
+    metric_paths = HealthDataSet(export_path, root=root).write_metric_exports(
+        out_dir,
+        source_priorities=priorities,
+        source_mode=source_mode,
+        max_heart_rate=max_heart_rate,
+    )
+    for filename, path in sorted(metric_paths.items()):
+        print(f"Saved: {filename} → {path}")
 
 def convert_xml_to_json():
     """Convert Apple Health export.xml into JSON files.
@@ -3521,16 +3585,16 @@ from healthai.ui import _W, _D, _C, _G, _Y, _X
 
 
 SLASH_COMMANDS = [
-    ("/diagnose",  "Diagnose export & generate debug report"),
+    ("/diagnose",  "Audit calculations, units, sources & export types"),
     ("/steps",     "Analyze steps"),
     ("/distance",  "Analyze distance"),
     ("/heartrate", "Analyze heart rate"),
     ("/weight",    "Analyze weight"),
     ("/sleep",     "Analyze sleep"),
     ("/workouts",  "Analyze workouts"),
-    ("/csv",       "Convert XML → CSV (full dump)"),
+    ("/csv",       "Export raw records + source-aware metric CSVs"),
     ("/json",      "Convert XML → JSON (full dump)"),
-    ("/settings",  "AI settings"),
+    ("/settings",  "AI model, source priority & workout intensity"),
     ("/reset",     "Reset preferences"),
     ("/changelog", "View change log"),
     ("/openclaw",  "OpenClaw setup guide"),
@@ -3551,6 +3615,78 @@ def _print_help(model_label: str) -> None:
     print()
 
 
+_SOURCE_METRICS = [
+    ("Steps", STEP_COUNT),
+    ("Walking/running distance", DISTANCE_WALKING_RUNNING),
+    ("Heart rate", HEART_RATE),
+    ("Body mass", BODY_MASS),
+    ("Sleep", SLEEP_ANALYSIS),
+]
+
+
+def _handle_source_settings(prefs: dict) -> None:
+    current_mode = prefs.get("source_mode", "reconcile")
+    print(f"\n  {_W}Source reconciliation:{_X} {current_mode}")
+    print(
+        f"  {_D}reconcile prevents overlapping devices from being double-counted; "
+        f"all preserves the legacy raw sum.{_X}"
+    )
+    mode = input(
+        f"  {_C}›{_X} Mode: reconcile or all [{current_mode}]: "
+    ).strip().lower()
+    if mode:
+        if mode not in {"reconcile", "all"}:
+            print(f"  {_Y}Invalid mode; keeping {current_mode}.{_X}")
+        else:
+            prefs["source_mode"] = mode
+
+    try:
+        dataset = HealthDataSet(resolve_export_xml())
+    except Exception as error:
+        print(f"  {_Y}Could not read sources from export.xml: {error}{_X}")
+        _save_ai_prefs(prefs)
+        return
+
+    print(f"\n  {_W}Set a per-metric source priority{_X}")
+    print(f"  {_D}Leave priority blank to use automatic Apple Watch/iPhone fallback.{_X}")
+    for index, (label, _) in enumerate(_SOURCE_METRICS, 1):
+        print(f"    {_D}{index}.{_X} {label}")
+    raw_metric = input(f"  {_C}›{_X} Metric number (0 to finish): ").strip()
+    if not raw_metric or raw_metric == "0":
+        _save_ai_prefs(prefs)
+        return
+    if not raw_metric.isdigit() or not 1 <= int(raw_metric) <= len(_SOURCE_METRICS):
+        print(f"  {_Y}Invalid metric; source settings unchanged.{_X}")
+        _save_ai_prefs(prefs)
+        return
+
+    label, record_type = _SOURCE_METRICS[int(raw_metric) - 1]
+    sources = dataset.available_sources(record_type)
+    print(f"\n  {_W}{label} sources:{_X}")
+    for source in sources:
+        print(f"  - {source}")
+    existing = prefs.get("source_priorities", {}).get(record_type, [])
+    entered = input(
+        f"  {_C}›{_X} Priority, comma-separated "
+        f"[{', '.join(existing) or 'automatic'}]: "
+    ).strip()
+    priorities = dict(prefs.get("source_priorities", {}))
+    if entered:
+        requested = [source.strip() for source in entered.split(",") if source.strip()]
+        canonical = {source.casefold(): source for source in sources}
+        unknown = [source for source in requested if source.casefold() not in canonical]
+        if unknown:
+            print(f"  {_Y}Unknown source(s): {', '.join(unknown)}. No change made.{_X}")
+            _save_ai_prefs(prefs)
+            return
+        priorities[record_type] = [canonical[source.casefold()] for source in requested]
+    else:
+        priorities.pop(record_type, None)
+    prefs["source_priorities"] = priorities
+    _save_ai_prefs(prefs)
+    print(f"  {_G}✓{_X} Source settings updated")
+
+
 def _handle_ai_settings() -> None:
     from healthai.models import pick_model
     from healthai.chat import get_configured_model, get_model_label
@@ -3559,8 +3695,49 @@ def _handle_ai_settings() -> None:
     print(f"\n  {_W}Current Settings:{_X}")
     print(f"  {_D}Model:{_X}      {get_model_label(current)}  {_D}({current}){_X}")
     print(f"  {_D}Output dir:{_X} {prefs.get('output_dir', 'not set')}")
-    print(f"  {_D}Export XML:{_X} {prefs.get('export_xml_path', 'not set')}")
+    print(
+        f"  {_D}Export XML:{_X} "
+        f"{prefs.get('export_xml') or prefs.get('export_xml_path', 'not set')}"
+    )
+    print(f"  {_D}Sources:{_X}    {prefs.get('source_mode', 'reconcile')}")
+    print(
+        f"  {_D}Max HR:{_X}     "
+        f"{prefs.get('max_heart_rate', 'not configured')}"
+    )
     print()
+
+    print(f"    {_D}1.{_X} Change AI model")
+    print(f"    {_D}2.{_X} Configure data-source reconciliation")
+    print(f"    {_D}3.{_X} Set maximum heart rate for workout intensity")
+    print(f"    {_D}0.{_X} Done")
+    choice = input(f"\n  {_C}›{_X} Setting number: ").strip()
+    if choice in {"", "0"}:
+        return
+    if choice == "2":
+        _handle_source_settings(prefs)
+        return
+    if choice == "3":
+        entered = input(
+            f"  {_C}›{_X} Maximum heart rate in BPM "
+            f"[{prefs.get('max_heart_rate', 'not configured')}]: "
+        ).strip()
+        if not entered:
+            prefs.pop("max_heart_rate", None)
+        else:
+            try:
+                value = float(entered)
+                if not 80 <= value <= 250:
+                    raise ValueError
+                prefs["max_heart_rate"] = value
+            except ValueError:
+                print(f"  {_Y}Enter a BPM value from 80 to 250.{_X}")
+                return
+        _save_ai_prefs(prefs)
+        print(f"  {_G}✓{_X} Maximum heart rate updated")
+        return
+    if choice != "1":
+        print(f"  {_Y}Invalid selection.{_X}")
+        return
 
     model_str, key_env = pick_model(current_model=current)
     if not model_str or model_str == current:
@@ -3762,7 +3939,4 @@ def check_env():
     return True
 
 if __name__ == "__main__":
-    check_requirements()
-    if not check_env():
-        print("\nContinuing without AI analysis capabilities...")
     main()

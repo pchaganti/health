@@ -2,7 +2,7 @@ IMAGE ?= applehealth
 EXPORT ?=
 OUT ?=$(PWD)
 
-.PHONY: help docker-build docker-run docker-run-bash run-local run setup-venv install clean-venv
+.PHONY: help docker-build docker-run docker-run-bash run-local run setup-venv install test clean-venv
 
 help:
 	@echo "Targets:"
@@ -13,6 +13,7 @@ help:
 	@echo "  make run [EXPORT=.. OUT=..]       # Auto-venv + run via ./run (prompts if no EXPORT)"
 	@echo "  make setup-venv                    # Create local Python venv (.venv)"
 	@echo "  make install                       # Install requirements into venv"
+	@echo "  make test                          # Run CLI regression tests"
 
 docker-build:
 	docker build -t $(IMAGE) .
@@ -55,6 +56,9 @@ setup-venv:
 install: setup-venv
 	$(PY) -m pip install --upgrade pip setuptools wheel
 	$(PIP) install -r requirements.txt
+
+test:
+	PYTHONPATH=src MPLBACKEND=Agg $(PY) -m unittest discover -s tests -v
 
 clean-venv:
 	rm -rf $(VENV)

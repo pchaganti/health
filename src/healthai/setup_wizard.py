@@ -1,31 +1,16 @@
 import os
-import json
 
 from healthai.ui import _C, _W, _D, _G, _Y, _X, print_banner
 from healthai.models import pick_model
-
-
-def _prefs_path() -> str:
-    home = os.path.expanduser("~")
-    pref_dir = os.path.join(home, ".applehealth")
-    os.makedirs(pref_dir, exist_ok=True)
-    return os.path.join(pref_dir, "ai_prefs.json")
+from healthai.preferences import load_preferences, save_preferences
 
 
 def _load_prefs() -> dict:
-    path = _prefs_path()
-    if os.path.exists(path):
-        try:
-            with open(path) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
+    return load_preferences()
 
 
 def _save_prefs(prefs: dict) -> None:
-    with open(_prefs_path(), "w") as f:
-        json.dump(prefs, f, indent=2)
+    save_preferences(prefs)
 
 
 def _ask(prompt: str, default: str = "") -> str:
@@ -97,11 +82,15 @@ def run_setup() -> dict:
     print(f"  {_W}Step 3 of 4 — Apple Health export.xml{_X}")
     print(f"  {_D}Export from: iPhone Health app → your avatar → Export All Health Data{_X}\n")
 
-    existing_export = prefs.get("export_xml_path", "")
-    if existing_export and os.path.exists(existing_export):
-        print(f"  {_G}✓{_X} Found saved path: {existing_export}")
-        keep = _ask("Keep it? (y/n)", "y").lower()
-        if keep == "n":
+    existing_export = prefs.get("export_xml") or prefs.get("export_xml_path", "")
+    if existing_export:
+        if os.path.exists(existing_export):
+            print(f"  {_G}✓{_X} Found saved path: {existing_export}")
+            keep = _ask("Keep it? (y/n)", "y").lower()
+            if keep == "n":
+                existing_export = ""
+        else:
+            print(f"  {_Y}⚠{_X}  Saved export path no longer exists")
             existing_export = ""
 
     if not existing_export:
@@ -109,6 +98,7 @@ def run_setup() -> dict:
         path = raw.strip().strip("'\"").replace("\\ ", " ")
         path = os.path.expanduser(path)
         if path and os.path.exists(path):
+            prefs["export_xml"] = path
             prefs["export_xml_path"] = path
             print(f"  {_G}✓{_X} export.xml found")
         elif path:

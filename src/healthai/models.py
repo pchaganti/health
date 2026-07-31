@@ -11,6 +11,9 @@ import json
 
 from healthai.ui import _C, _W, _D, _G, _Y, _X
 
+# Use LiteLLM's bundled catalogue so opening the CLI never requires a network lookup.
+os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+
 # ── Curated featured models (always shown first) ─────────────────────────────
 # (group, litellm_string, display_name, needs_key, key_env)
 _FEATURED: list[tuple[str, str, str, bool, str | None]] = [
