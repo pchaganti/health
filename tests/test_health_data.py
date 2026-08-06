@@ -285,6 +285,168 @@ class HealthDataSetTests(unittest.TestCase):
             "date,value,in_bed_hours",
         )
 
+    def test_source_filter_excludes_other_apps_entirely(self):
+        record_type = "HKQuantityTypeIdentifierStepCount"
+        self.write_export(
+            records=[
+                self.quantity(
+                    record_type,
+                    1000,
+                    "count",
+                    "2026-07-01 09:00:00 +0800",
+                    "2026-07-01 10:00:00 +0800",
+                    "Apple Watch",
+                ),
+                self.quantity(
+                    record_type,
+                    5000,
+                    "count",
+                    "2026-07-01 12:00:00 +0800",
+                    "2026-07-01 13:00:00 +0800",
+                    "Argus",
+                ),
+            ]
+        )
+        filtered = HealthDataSet(
+            self.export_path,
+            source_filter=["apple watch"],
+        )
+
+        daily = filtered.daily_quantity(record_type, "cumulative")
+
+        self.assertEqual(daily.iloc[0], 1000)
+
+    def test_source_filter_applies_to_workouts_and_sleep(self):
+        sleep_type = "HKCategoryTypeIdentifierSleepAnalysis"
+        root = ET.Element("HealthData")
+        ET.SubElement(
+            root,
+            "Record",
+            {
+                "type": sleep_type,
+                "sourceName": "Argus",
+                "value": "HKCategoryValueSleepAnalysisAsleepUnspecified",
+                "startDate": "2026-07-01 00:00:00 +0800",
+                "endDate": "2026-07-01 07:00:00 +0800",
+            },
+        )
+        ET.SubElement(
+            root,
+            "Workout",
+            {
+                "workoutActivityType": "HKWorkoutActivityTypeRunning",
+                "sourceName": "Argus",
+                "startDate": "2026-07-01 09:00:00 +0800",
+                "endDate": "2026-07-01 10:00:00 +0800",
+            },
+        )
+        ET.ElementTree(root).write(
+            self.export_path,
+            encoding="utf-8",
+            xml_declaration=True,
+        )
+        filtered = HealthDataSet(
+            self.export_path,
+            source_filter=["Apple Watch"],
+        )
+
+        self.assertTrue(filtered.sleep_records().empty)
+        self.assertTrue(filtered.workouts().empty)
+
+    def test_available_sources_ignores_active_filter(self):
+        record_type = "HKQuantityTypeIdentifierStepCount"
+        self.write_export(
+            records=[
+                self.quantity(
+                    record_type,
+                    1000,
+                    "count",
+                    "2026-07-01 09:00:00 +0800",
+                    "2026-07-01 10:00:00 +0800",
+                    "Argus",
+                ),
+            ]
+        )
+        filtered = HealthDataSet(
+            self.export_path,
+            source_filter=["Apple Watch"],
+        )
+
+        self.assertEqual(filtered.available_sources(record_type), ["Argus"])
+        self.assertEqual(filtered.all_sources(), ["Argus"])
+
+    def test_imperial_exports_convert_distance_and_weight(self):
+        dataset = self.write_export(
+            records=[
+                self.quantity(
+                    "HKQuantityTypeIdentifierDistanceWalkingRunning",
+                    1.609344,
+                    "km",
+                    "2026-07-01 09:00:00 +0800",
+                    "2026-07-01 10:00:00 +0800",
+                ),
+                self.quantity(
+                    "HKQuantityTypeIdentifierBodyMass",
+                    45.359237,
+                    "kg",
+                    "2026-07-01 08:00:00 +0800",
+                    "2026-07-01 08:00:00 +0800",
+                ),
+            ],
+            workouts=[
+                (
+                    {
+                        "workoutActivityType": "HKWorkoutActivityTypeRunning",
+                        "sourceName": "Apple Watch",
+                        "startDate": "2026-07-01 09:00:00 +0800",
+                        "endDate": "2026-07-01 10:00:00 +0800",
+                        "totalDistance": "3.218688",
+                        "totalDistanceUnit": "km",
+                    },
+                    [],
+                ),
+            ],
+        )
+        output_dir = Path(self.temp_dir.name) / "imperial"
+
+        dataset.write_metric_exports(output_dir, unit_system="imperial")
+
+        distance = (output_dir / "distance_data.csv").read_text().splitlines()
+        self.assertAlmostEqual(float(distance[1].split(",")[1]), 1.0, places=5)
+        weight = (output_dir / "weight_data.csv").read_text().splitlines()
+        self.assertAlmostEqual(float(weight[1].split(",")[1]), 100.0, places=5)
+        workout_lines = (output_dir / "workout_data.csv").read_text().splitlines()
+        header = workout_lines[0].split(",")
+        self.assertIn("distance_mi", header)
+        self.assertNotIn("distance_km", header)
+        distance_index = header.index("distance_mi")
+        self.assertAlmostEqual(
+            float(workout_lines[1].split(",")[distance_index]), 2.0, places=5
+        )
+
+    def test_metric_exports_keep_canonical_units_and_columns(self):
+        dataset = self.write_export(
+            records=[
+                self.quantity(
+                    "HKQuantityTypeIdentifierDistanceWalkingRunning",
+                    2.5,
+                    "km",
+                    "2026-07-01 09:00:00 +0800",
+                    "2026-07-01 10:00:00 +0800",
+                ),
+            ],
+        )
+        output_dir = Path(self.temp_dir.name) / "metric"
+
+        dataset.write_metric_exports(output_dir)
+
+        distance = (output_dir / "distance_data.csv").read_text().splitlines()
+        self.assertAlmostEqual(float(distance[1].split(",")[1]), 2.5, places=5)
+        workout_header = (
+            (output_dir / "workout_data.csv").read_text().splitlines()[0]
+        )
+        self.assertIn("distance_km", workout_header)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -21,6 +21,8 @@ def _migrate(preferences: dict[str, Any]) -> dict[str, Any]:
         preferences["export_xml_path"] = export_path
     preferences.setdefault("source_mode", "reconcile")
     preferences.setdefault("source_priorities", {})
+    preferences.setdefault("source_filter", [])
+    preferences.setdefault("unit_system", "metric")
     return preferences
 
 

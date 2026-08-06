@@ -105,6 +105,10 @@ Apple Health exports can contain overlapping measurements from an iPhone, Apple 
 
 All supported units are normalized before aggregation: distance to kilometers, body mass to kilograms, energy to kilocalories, and heart rate to BPM. Unsupported units are skipped and listed by `/diagnose`; they are never silently mislabeled.
 
+**Imperial units (miles / pounds):** open `/settings` → *Choose units* and pick `imperial`. Charts, summaries, exported CSVs, and AI analyses then use miles and pounds instead of km and kg. You can also set `APPLEHEALTH_UNITS=imperial` in the environment.
+
+**Source filter (e.g. only Apple Watch):** if a third-party app (Argus, Fitbit, etc.) pollutes your metrics, open `/settings` → *Configure data sources* and enter the sources to include — everything else is ignored entirely, no editing of `export.xml` required. Non-interactive equivalent: `APPLEHEALTH_SOURCES="Keith's Apple Watch"` (comma-separate multiple sources; names must match the sources listed in the settings screen).
+
 **Or clone and run directly:**
 ```bash
 git clone https://github.com/krumjahn/applehealth.git && cd applehealth

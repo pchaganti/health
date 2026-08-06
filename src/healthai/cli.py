@@ -61,6 +61,7 @@ from healthai.health_data import (
     SLEEP_ANALYSIS,
     STEP_COUNT,
     HealthDataSet,
+    display_unit,
 )
 try:
     import anthropic  # Claude SDK
@@ -1059,6 +1060,36 @@ def _calculation_preferences() -> Tuple[dict, str, Optional[float]]:
     return priorities, source_mode, max_heart_rate
 
 
+def _source_filter() -> List[str]:
+    """Only include data from these sources; APPLEHEALTH_SOURCES env overrides prefs."""
+    from_env = _parse_csv_env("APPLEHEALTH_SOURCES")
+    if from_env:
+        return from_env
+    configured = _load_ai_prefs().get("source_filter", [])
+    if isinstance(configured, list):
+        return [str(source) for source in configured]
+    return []
+
+
+def _unit_system() -> str:
+    """metric (default) or imperial; APPLEHEALTH_UNITS env overrides prefs."""
+    configured = (
+        os.environ.get("APPLEHEALTH_UNITS")
+        or _load_ai_prefs().get("unit_system")
+        or "metric"
+    ).strip().lower()
+    return configured if configured in {"metric", "imperial"} else "metric"
+
+
+def _load_dataset(export_path=None, root=None) -> HealthDataSet:
+    """Construct a HealthDataSet honoring the configured source filter."""
+    return HealthDataSet(
+        export_path or resolve_export_xml(),
+        root=root,
+        source_filter=_source_filter(),
+    )
+
+
 def _daily_quantity(
     dataset: HealthDataSet,
     record_type: str,
@@ -1084,12 +1115,13 @@ def prepare_metric_exports(
     priorities, source_mode, max_heart_rate = _calculation_preferences()
     if not quiet:
         print("Generating source-aware daily metric files...")
-    dataset = HealthDataSet(resolved_export)
+    dataset = _load_dataset(resolved_export)
     written = dataset.write_metric_exports(
         resolved_output,
         source_priorities=priorities,
         source_mode=source_mode,
         max_heart_rate=max_heart_rate,
+        unit_system=_unit_system(),
     )
     if not quiet:
         for filename, path in sorted(written.items()):
@@ -1111,7 +1143,7 @@ def parse_health_data(file_path, record_type):
         pandas.DataFrame: DataFrame containing dates and values for the specified metric
     """
     print(f"Starting to parse {record_type}...")
-    dataset = HealthDataSet(file_path)
+    dataset = _load_dataset(file_path)
     records = dataset.quantity_records(record_type)
     print(f"Found {len(records)} records")
     if dataset.issues:
@@ -1245,7 +1277,7 @@ def generate_debug_reports(file_path: str) -> Tuple[str, str]:
     """
     summary = scan_export_types(file_path)
     priorities, source_mode, max_heart_rate = _calculation_preferences()
-    dataset = HealthDataSet(file_path)
+    dataset = _load_dataset(file_path)
     metric_summary: Dict[str, Any] = {}
     for label, record_type, aggregation, unit in [
         ("steps", STEP_COUNT, "cumulative", "count"),
@@ -1310,6 +1342,8 @@ def generate_debug_reports(file_path: str) -> Tuple[str, str]:
         ),
     }
     summary["source_mode"] = source_mode
+    summary["source_filter"] = _source_filter() or "all sources"
+    summary["unit_system"] = _unit_system()
     summary["metric_summary"] = metric_summary
     summary["calculation_issues"] = dataset.issues
     out_dir = get_output_dir()
@@ -1375,7 +1409,7 @@ def analyze_steps():
     """
     export_path = resolve_export_xml()
     print(f"Using export file: {export_path}")
-    dataset = HealthDataSet(export_path)
+    dataset = _load_dataset(export_path)
     daily_steps = _daily_quantity(dataset, STEP_COUNT, "cumulative")
     
     # Check if any step data was found
@@ -1460,13 +1494,15 @@ def analyze_distance():
     """
     export_path = resolve_export_xml()
     print(f"Using export file: {export_path}")
-    dataset = HealthDataSet(export_path)
+    dataset = _load_dataset(export_path)
     daily_distance = _daily_quantity(
         dataset,
         DISTANCE_WALKING_RUNNING,
         "cumulative",
     )
-    
+    unit_label, unit_factor = display_unit("distance", _unit_system())
+    daily_distance = daily_distance * unit_factor
+
     # Check if any distance data was found
     if len(daily_distance) == 0:
         print("No distance data found in the export file.")
@@ -1478,14 +1514,14 @@ def analyze_distance():
     # Export to CSV
     csv_path = get_output_path('distance_data.csv')
     daily_distance.to_csv(csv_path, header=True)
-    print(f"Distance data exported to {csv_path}")
+    print(f"Distance data exported to {csv_path} (values in {unit_label})")
     
     # Plot
     plt.figure(figsize=(12, 6))
     daily_distance.plot()
     plt.title('Daily Walking/Running Distance')
     plt.xlabel('Date')
-    plt.ylabel('Distance (km)')
+    plt.ylabel(f'Distance ({unit_label})')
     plt.grid(True)
     plot_path = get_output_path('distance_plot.png')
     try:
@@ -1514,10 +1550,10 @@ def analyze_distance():
 
         print("\nDistance Summary:")
         print(f"- Date range: {date_min} to {date_max} ({total_days} days)")
-        print(f"- Total distance: {total_km:.1f} km")
-        print(f"- Average per day: {avg_km:.2f} km (median {median_km:.2f} km)")
-        print(f"- Best day: {max_day} with {max_km:.2f} km")
-        print(f"- Last 7-day average: {last7_avg:.2f} km")
+        print(f"- Total distance: {total_km:.1f} {unit_label}")
+        print(f"- Average per day: {avg_km:.2f} {unit_label} (median {median_km:.2f} {unit_label})")
+        print(f"- Best day: {max_day} with {max_km:.2f} {unit_label}")
+        print(f"- Last 7-day average: {last7_avg:.2f} {unit_label}")
         print(f"- CSV: {csv_path}")
         print(f"- Plot: {plot_path}")
     except Exception:
@@ -1530,7 +1566,7 @@ def analyze_heart_rate():
     """
     export_path = resolve_export_xml()
     print(f"Using export file: {export_path}")
-    dataset = HealthDataSet(export_path)
+    dataset = _load_dataset(export_path)
     daily_hr = _daily_quantity(dataset, HEART_RATE, "average")
     
     # Check if any heart rate data was found
@@ -1597,9 +1633,11 @@ def analyze_weight():
     """
     export_path = resolve_export_xml()
     print(f"Using export file: {export_path}")
-    dataset = HealthDataSet(export_path)
+    dataset = _load_dataset(export_path)
     daily_weight = _daily_quantity(dataset, BODY_MASS, "latest")
-    
+    unit_label, unit_factor = display_unit("weight", _unit_system())
+    daily_weight = daily_weight * unit_factor
+
     # Check if any weight data was found
     if len(daily_weight) == 0:
         print("No weight data found in the export file.")
@@ -1611,14 +1649,14 @@ def analyze_weight():
     # Export to CSV
     csv_path = get_output_path('weight_data.csv')
     daily_weight.to_csv(csv_path, header=True)
-    print(f"Weight data exported to {csv_path}")
+    print(f"Weight data exported to {csv_path} (values in {unit_label})")
 
     # Plot
     plt.figure(figsize=(12, 6))
     daily_weight.plot()
     plt.title('Body Weight Over Time')
     plt.xlabel('Date')
-    plt.ylabel('Weight (kg)')
+    plt.ylabel(f'Weight ({unit_label})')
     plt.grid(True)
     plot_path = get_output_path('weight_plot.png')
     try:
@@ -1647,9 +1685,9 @@ def analyze_weight():
 
         print("\nWeight Summary:")
         print(f"- Date range: {date_min} to {date_max} ({total_days} days)")
-        print(f"- Average: {avg_wt:.1f} kg (median {median_wt:.1f} kg)")
-        print(f"- Min: {min_wt:.1f} kg on {min_day}")
-        print(f"- Max: {max_wt:.1f} kg on {max_day}")
+        print(f"- Average: {avg_wt:.1f} {unit_label} (median {median_wt:.1f} {unit_label})")
+        print(f"- Min: {min_wt:.1f} {unit_label} on {min_day}")
+        print(f"- Max: {max_wt:.1f} {unit_label} on {max_day}")
         print(f"- CSV: {csv_path}")
         print(f"- Plot: {plot_path}")
     except Exception:
@@ -1663,7 +1701,7 @@ def analyze_sleep():
     print("Analyzing sleep data...")
     export_path = resolve_export_xml()
     print(f"Using export file: {export_path}")
-    dataset = HealthDataSet(export_path)
+    dataset = _load_dataset(export_path)
     records = dataset.sleep_records()
     priorities, _, _ = _calculation_preferences()
     daily_sleep, stage_daily, daily_in_bed = dataset.sleep_summary(
@@ -1791,11 +1829,16 @@ def analyze_workouts():
     export_path = resolve_export_xml()
     print(f"Using export file: {export_path}")
     priorities, _, max_heart_rate = _calculation_preferences()
-    dataset = HealthDataSet(export_path)
+    dataset = _load_dataset(export_path)
     df = dataset.workouts(
         source_priority=priorities.get(HEART_RATE),
         max_heart_rate=max_heart_rate,
     )
+    distance_label, distance_factor = display_unit("distance", _unit_system())
+    distance_column = "distance_km" if distance_factor == 1.0 else "distance_mi"
+    if distance_factor != 1.0 and "distance_km" in df:
+        df = df.rename(columns={"distance_km": "distance_mi"})
+        df["distance_mi"] = (df["distance_mi"] * distance_factor).round(6)
 
     if df.empty:
         print("No workout data found!")
@@ -1863,7 +1906,7 @@ def analyze_workouts():
     print(f"Average workout duration: {df['duration_minutes'].mean():.1f} minutes")
     print(f"Total workout time: {df['duration_hours'].sum():.1f} hours")
     print(f"Total calories burned: {df['calories'].sum():.0f} kcal")
-    print(f"Total distance: {df['distance_km'].sum():.1f} km")
+    print(f"Total distance: {df[distance_column].sum():.1f} {distance_label}")
     print(f"CSV: {csv_path}")
     print(f"Plot: {plot_path}")
 
@@ -1899,8 +1942,8 @@ def analyze_workouts():
         print(f"Duration: {workout['duration_minutes']:.1f} minutes")
         if workout["calories"] > 0:
             print(f"Calories: {workout['calories']:.0f} kcal")
-        if workout["distance_km"] > 0:
-            print(f"Distance: {workout['distance_km']:.1f} km")
+        if workout[distance_column] > 0:
+            print(f"Distance: {workout[distance_column]:.1f} {distance_label}")
         if not pd.isna(workout["avg_heart_rate"]):
             print(
                 f"Heart rate: avg {workout['avg_heart_rate']:.0f}, "
@@ -2014,7 +2057,10 @@ def analyze_with_chatgpt(csv_files):
         return
 
     # Build the prompt
-    prompt = "Analyze this Apple Health data and provide detailed insights:\n\n"
+    prompt = (
+        "Analyze this Apple Health data and provide detailed insights:\n"
+        + _ai_units_note() + "\n"
+    )
     for data_type, summary in data_summary.items():
         prompt += f"\n{data_type} Data Summary:\n"
         prompt += f"- Total Records: {summary['total_records']}\n"
@@ -2187,7 +2233,10 @@ def analyze_with_ollama(csv_files):
             return
 
         # Build the prompt
-        prompt = "Analyze this Apple Health data and provide detailed insights:\n\n"
+        prompt = (
+            "Analyze this Apple Health data and provide detailed insights:\n"
+            + _ai_units_note() + "\n"
+        )
         for data_type, summary in data_summary.items():
             prompt += f"\n{data_type} Data Summary:\n"
             prompt += f"- Total Records: {summary['total_records']}\n"
@@ -2382,7 +2431,10 @@ def analyze_with_external_ollama(csv_files):
             return
 
         # Build the prompt
-        user_prompt = "Analyze this Apple Health data and provide detailed insights:\n\n"
+        user_prompt = (
+            "Analyze this Apple Health data and provide detailed insights:\n"
+            + _ai_units_note() + "\n"
+        )
         for data_type, summary in data_summary.items():
             user_prompt += f"\n{data_type} Data Summary:\n"
             user_prompt += f"- Total Records: {summary['total_records']}\n"
@@ -2573,6 +2625,16 @@ def _get_or_prompt_key(env_name: str, label: str) -> str:
     os.environ[env_name] = key
     return key
 
+def _ai_units_note() -> str:
+    """One-line unit legend so AI analyses describe values in the user's units."""
+    distance_label, _ = display_unit("distance", _unit_system())
+    weight_label, _ = display_unit("weight", _unit_system())
+    return (
+        f"(Units: distance in {distance_label}, weight in {weight_label}, "
+        "steps in counts, heart rate in BPM, sleep in hours.)\n"
+    )
+
+
 def _prepare_ai_data(csv_files):
     """Generate missing CSVs if needed and build a shared prompt."""
     missing_files = []
@@ -2629,7 +2691,10 @@ def _prepare_ai_data(csv_files):
         print("\nNo data files with content could be processed! Please check your export.xml file.")
         return None, None
 
-    prompt = "Analyze this Apple Health data and provide detailed insights:\n\n"
+    prompt = (
+        "Analyze this Apple Health data and provide detailed insights:\n"
+        + _ai_units_note() + "\n"
+    )
     for data_type, summary in data_summary.items():
         prompt += f"\n{data_type} Data Summary:\n"
         prompt += f"- Total Records: {summary['total_records']}\n"
@@ -3412,11 +3477,12 @@ def convert_xml_to_csv():
 
     print("\nGenerating processed metric CSVs for chat and slash commands…")
     priorities, source_mode, max_heart_rate = _calculation_preferences()
-    metric_paths = HealthDataSet(export_path, root=root).write_metric_exports(
+    metric_paths = _load_dataset(export_path, root=root).write_metric_exports(
         out_dir,
         source_priorities=priorities,
         source_mode=source_mode,
         max_heart_rate=max_heart_rate,
+        unit_system=_unit_system(),
     )
     for filename, path in sorted(metric_paths.items()):
         print(f"Saved: {filename} → {path}")
@@ -3647,6 +3713,45 @@ def _handle_source_settings(prefs: dict) -> None:
         _save_ai_prefs(prefs)
         return
 
+    all_sources = dataset.all_sources()
+    current_filter = prefs.get("source_filter", [])
+    print(f"\n  {_W}Source filter (only include data from these sources):{_X}")
+    print(f"  {_D}Current: {', '.join(current_filter) or 'all sources included'}{_X}")
+    print(f"  {_D}Sources in your export:{_X}")
+    for source in all_sources:
+        print(f"  - {source}")
+    entered_filter = input(
+        f"  {_C}›{_X} Sources to include, comma-separated "
+        f"(blank keeps current, 'all' clears the filter): "
+    ).strip()
+    if entered_filter:
+        if entered_filter.lower() == "all":
+            prefs["source_filter"] = []
+            print(f"  {_G}✓{_X} Source filter cleared; all sources included")
+        else:
+            requested = [
+                source.strip()
+                for source in entered_filter.split(",")
+                if source.strip()
+            ]
+            canonical = {source.casefold(): source for source in all_sources}
+            unknown = [
+                source for source in requested if source.casefold() not in canonical
+            ]
+            if unknown:
+                print(
+                    f"  {_Y}Unknown source(s): {', '.join(unknown)}. "
+                    f"Filter unchanged.{_X}"
+                )
+            else:
+                prefs["source_filter"] = [
+                    canonical[source.casefold()] for source in requested
+                ]
+                print(
+                    f"  {_G}✓{_X} Only including: "
+                    f"{', '.join(prefs['source_filter'])}"
+                )
+
     print(f"\n  {_W}Set a per-metric source priority{_X}")
     print(f"  {_D}Leave priority blank to use automatic Apple Watch/iPhone fallback.{_X}")
     for index, (label, _) in enumerate(_SOURCE_METRICS, 1):
@@ -3700,6 +3805,12 @@ def _handle_ai_settings() -> None:
         f"{prefs.get('export_xml') or prefs.get('export_xml_path', 'not set')}"
     )
     print(f"  {_D}Sources:{_X}    {prefs.get('source_mode', 'reconcile')}")
+    source_filter = prefs.get("source_filter", [])
+    print(
+        f"  {_D}Filter:{_X}     "
+        f"{', '.join(source_filter) if source_filter else 'all sources'}"
+    )
+    print(f"  {_D}Units:{_X}      {prefs.get('unit_system', 'metric')}")
     print(
         f"  {_D}Max HR:{_X}     "
         f"{prefs.get('max_heart_rate', 'not configured')}"
@@ -3707,14 +3818,28 @@ def _handle_ai_settings() -> None:
     print()
 
     print(f"    {_D}1.{_X} Change AI model")
-    print(f"    {_D}2.{_X} Configure data-source reconciliation")
+    print(f"    {_D}2.{_X} Configure data sources (reconciliation + filter)")
     print(f"    {_D}3.{_X} Set maximum heart rate for workout intensity")
+    print(f"    {_D}4.{_X} Choose units (metric km/kg or imperial mi/lb)")
     print(f"    {_D}0.{_X} Done")
     choice = input(f"\n  {_C}›{_X} Setting number: ").strip()
     if choice in {"", "0"}:
         return
     if choice == "2":
         _handle_source_settings(prefs)
+        return
+    if choice == "4":
+        current_units = prefs.get("unit_system", "metric")
+        entered = input(
+            f"  {_C}›{_X} Units: metric or imperial [{current_units}]: "
+        ).strip().lower()
+        if entered:
+            if entered not in {"metric", "imperial"}:
+                print(f"  {_Y}Enter 'metric' or 'imperial'.{_X}")
+                return
+            prefs["unit_system"] = entered
+            _save_ai_prefs(prefs)
+            print(f"  {_G}✓{_X} Units set to {entered}")
         return
     if choice == "3":
         entered = input(

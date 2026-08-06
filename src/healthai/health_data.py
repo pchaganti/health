@@ -27,6 +27,23 @@ TARGET_UNITS = {
     BODY_MASS: "kg",
 }
 
+KM_PER_MILE = 1.609344
+KG_PER_POUND = 0.45359237
+
+DISPLAY_UNITS = {
+    "metric": {"distance": ("km", 1.0), "weight": ("kg", 1.0)},
+    "imperial": {
+        "distance": ("mi", 1.0 / KM_PER_MILE),
+        "weight": ("lb", 1.0 / KG_PER_POUND),
+    },
+}
+
+
+def display_unit(kind: str, unit_system: str) -> tuple[str, float]:
+    """Return (label, factor-from-canonical) for showing a metric to the user."""
+    system = DISPLAY_UNITS.get(unit_system) or DISPLAY_UNITS["metric"]
+    return system[kind]
+
 METRIC_EXPORTS = {
     STEP_COUNT: ("steps_data.csv", "cumulative"),
     DISTANCE_WALKING_RUNNING: ("distance_data.csv", "cumulative"),
@@ -172,16 +189,28 @@ class HealthDataSet:
         self,
         export_path: str | Path,
         root: ET.Element | None = None,
+        source_filter: Sequence[str] | None = None,
     ):
         self.export_path = Path(export_path).expanduser().resolve()
         self.root = root if root is not None else ET.parse(self.export_path).getroot()
         self.issues: list[str] = []
+        cleaned = [source.strip() for source in (source_filter or []) if source.strip()]
+        self.source_filter: set[str] | None = (
+            {source.casefold() for source in cleaned} if cleaned else None
+        )
+
+    def _source_allowed(self, source: str | None) -> bool:
+        if self.source_filter is None:
+            return True
+        return (source or "Unknown").casefold() in self.source_filter
 
     def quantity_records(self, record_type: str) -> pd.DataFrame:
         target_unit = TARGET_UNITS.get(record_type)
         rows: list[dict[str, Any]] = []
         for record in self.root.findall(".//Record"):
             if record.get("type") != record_type:
+                continue
+            if not self._source_allowed(record.get("sourceName")):
                 continue
             try:
                 start = parse_apple_datetime(record.get("startDate") or "")
@@ -340,6 +369,8 @@ class HealthDataSet:
         rows: list[dict[str, Any]] = []
         for record in self.root.findall(".//Record"):
             if record.get("type") != SLEEP_ANALYSIS:
+                continue
+            if not self._source_allowed(record.get("sourceName")):
                 continue
             try:
                 start = parse_apple_datetime(record.get("startDate") or "")
@@ -502,6 +533,8 @@ class HealthDataSet:
         )
         rows: list[dict[str, Any]] = []
         for workout in self.root.findall(".//Workout"):
+            if not self._source_allowed(workout.get("sourceName")):
+                continue
             try:
                 start = parse_apple_datetime(workout.get("startDate") or "")
                 end = parse_apple_datetime(workout.get("endDate") or "")
@@ -648,13 +681,22 @@ class HealthDataSet:
         return pd.DataFrame(rows).sort_values("start_time")
 
     def available_sources(self, record_type: str) -> list[str]:
-        if record_type == SLEEP_ANALYSIS:
-            records = self.sleep_records()
-        else:
-            records = self.quantity_records(record_type)
-        if records.empty:
-            return []
-        return sorted(records["source"].dropna().unique().tolist())
+        """All sources present for a record type, ignoring any active filter."""
+        sources = {
+            record.get("sourceName") or "Unknown"
+            for record in self.root.findall(".//Record")
+            if record.get("type") == record_type
+        }
+        return sorted(sources)
+
+    def all_sources(self) -> list[str]:
+        """Every distinct source across records and workouts, ignoring filters."""
+        sources = {
+            element.get("sourceName") or "Unknown"
+            for element in self.root.iter()
+            if element.tag in {"Record", "Workout"}
+        }
+        return sorted(sources)
 
     def write_metric_exports(
         self,
@@ -662,11 +704,14 @@ class HealthDataSet:
         source_priorities: dict[str, list[str]] | None = None,
         source_mode: str = "reconcile",
         max_heart_rate: float | None = None,
+        unit_system: str = "metric",
     ) -> dict[str, Path]:
         output = Path(output_dir).expanduser().resolve()
         output.mkdir(parents=True, exist_ok=True)
         priorities = source_priorities or {}
         written: dict[str, Path] = {}
+        _, distance_factor = display_unit("distance", unit_system)
+        _, weight_factor = display_unit("weight", unit_system)
 
         for record_type, (filename, aggregation) in METRIC_EXPORTS.items():
             daily = self.daily_quantity(
@@ -675,6 +720,10 @@ class HealthDataSet:
                 priorities.get(record_type),
                 source_mode,
             )
+            if record_type == DISTANCE_WALKING_RUNNING:
+                daily = daily * distance_factor
+            elif record_type == BODY_MASS:
+                daily = daily * weight_factor
             path = output / filename
             daily.to_csv(path, header=True)
             written[filename] = path
@@ -728,6 +777,9 @@ class HealthDataSet:
             priorities.get(HEART_RATE),
             max_heart_rate=max_heart_rate,
         )
+        if distance_factor != 1.0 and "distance_km" in workouts:
+            workouts = workouts.rename(columns={"distance_km": "distance_mi"})
+            workouts["distance_mi"] = (workouts["distance_mi"] * distance_factor).round(6)
         workout_path = output / "workout_data.csv"
         workouts.to_csv(workout_path, index=False)
         written["workout_data.csv"] = workout_path
